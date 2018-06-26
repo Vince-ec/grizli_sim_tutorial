@@ -4,6 +4,7 @@ import numpy as np
 from grizli import model as griz_model
 from scipy.interpolate import interp1d
 import pysynphot as S
+from astropy.table import Table
 
 def Scale_model(data, sigma, model):
     return np.sum(((data * model) / sigma ** 2)) / np.sum((model ** 2 / sigma ** 2))
@@ -94,8 +95,9 @@ class Gen_sim(object):
 
         sim_g102.photutils_detection(detect_thresh=.025, verbose=True, save_detection=True)
 
+        c = Table.read('s47677_flt.detect.cat',format='ascii')
+        sim_g102.catalog = c
         keep = sim_g102.catalog['mag'] < 29
-        c = sim_g102.catalog
 
         sim_g102.compute_full_model(ids=c['id'][keep], mags=c['mag'][keep], verbose=False)
 
