@@ -1,146 +1,77 @@
 __author__ = 'Vince.ec'
 
+from grizli import model
 import numpy as np
-from grizli import model as griz_model
 from scipy.interpolate import interp1d
-import pysynphot as S
 from astropy.table import Table
+from astropy import wcs
+from astropy.io import fits
+from glob import glob
+import os
+
+def Extract_BeamCutout(target_id, grism_file, mosaic, seg_map, instruement, catalog):
+    flt = model.GrismFLT(grism_file = grism_file ,
+                          ref_file = mosaic, seg_file = seg_map,
+                            pad=200, ref_ext=0, shrink_segimage=True, force_grism = instrument)
+    
+    # catalog / semetation image
+    ref_cat = Table.read(catalog ,format='ascii')
+    seg_cat = flt.blot_catalog(ref_cat,sextractor=False)
+    flt.compute_full_model(ids=seg_cat['id'])
+    beam = flt.object_dispersers[target_id][2]['A']
+    co = model.BeamCutout(flt, beam, conf=flt.conf)
+    
+    PA = np.round(fits.open(grism_file)[0].header['PA_V3'] , 1)
+    
+    co.write_fits(root='beams/o{0}'.format(PA), clobber=True)
+
+    ### add EXPTIME to extension 0
+    
+    
+    fits.setval('beams/o{0}_{1}.{2}.A.fits'.format(PA, target_id, instrument), 'EXPTIME', ext=0,
+            value=fits.open('beams/o{0}_{1}.{2}.A.fits'.format(PA, target_id, instrument))[1].header['EXPTIME'])   
 
 def Scale_model(data, sigma, model):
     return np.sum(((data * model) / sigma ** 2)) / np.sum((model ** 2 / sigma ** 2))
 
 
-def  Gauss_dist(x, mu, sigma):
-    return (1. / (sigma * np.sqrt(2 * np.pi))) * np.exp(-((x - mu) ** 2) / (2 * sigma ** 2))
-
-def Min_sig(wv,c,ew,line,max_fl):
-    U = 0
-    sig_guess = 1.
-    dx = 1.
-
-    while np.abs(U - ew) > 0.1:
-        flam = Gauss_dist(wv, line, sig_guess)
-        flam *= (max_fl / max(flam))
-        U = np.trapz(flam / c,wv)
-
-        if np.abs(U - ew) < 0.1:
-            break
-        if ew - U  > 0:
-            sig_guess +=dx
-        if ew - U < 0:
-            sig_guess -= dx
-            dx/=10
-            sig_guess += dx
-            
-    return sig_guess
-
-def Gen_spec(wv_range, lines, ews, maxs):
-    spec = np.repeat(1E-18, len(wv_range))
-    c = np.repeat(1E-18, len(wv_range))
-    
-    emmision = np.zeros([len(lines),len(wv_range)])
-
-    for i in range(len(lines)):
-        sig = Min_sig(wv_range, c, ews[i], lines[i], maxs[i])
-        emmision[i] = Gauss_dist(wv_range,lines[i],sig)
-        emmision[i] *= ( maxs[i]/ np.max(emmision[i]))
-        
-        spec += emmision[i]
-    return wv_range, spec
-
-class Gen_sim(object):
-    def __init__(self, redshift, wavelength, flux, signal_to_noise, minwv = 8000, maxwv = 11300):
-        import pysynphot as S
+class Gen_spec(object):
+    def __init__(self, beam, redshift,gal_wv, gal_fl, gal_er, minwv = 7800, maxwv = 11200):
+        self.beam = model.BeamCutout(fits_file = beam)
         self.redshift = redshift
-        self.wv = wavelength
-        self.wv_obs = self.wv * (1 + self.redshift)
-        self.fl = flux
-        self.SNR = signal_to_noise
-        self.er = self.fl / self.SNR
+        self.gal_wv = gal_wv 
+        self.gal_fl = gal_fl
+        self.gal_er = gal_er
         """ 
-        self.flt_input - image flt which contains the object you're interested in modeling 
-        **
-        self.beam - information used to make models
-        **
-        self.redshift - redshift of simulation
-        **
-        self.wv - input wavelength array of spectrum
-        **
-        self.wv_obs - input wavelength array of spectrum
-        **
-        self.fl - input flux array
-        **
-        self.er - output error array 
-        **
-        self.SNR - signal to noise ratio used to generate error
-        **
-        self.mfl - forward modeled flux array
-        **
-        self.mfl - forward modeled flux array
-        **        
-        self.mwv - output wavelength array in the observed frame
-        **
-        self.flx_err - output flux array of spectra perturb by the errors
-
-        """      
-        
-        ## set flt file, we're using a good example galaxy
-        self.flt_input = 's47677_flt.fits' 
 
 
-        ## Create Grizli model object
-        sim_g102 = griz_model.GrismFLT(grism_file='', verbose=False,
-                                         direct_file=self.flt_input,
-                                         force_grism='G102')
+        """
 
-        sim_g102.photutils_detection(detect_thresh=.025, verbose=True, save_detection=True)
+        IDX = [U for U in range(len(self.gal_wv)) if minwv <= self.gal_wv[U] <= maxwv]
 
-        c = Table.read('s47677_flt.detect.cat',format='ascii')
-        sim_g102.catalog = c
-        keep = sim_g102.catalog['mag'] < 29
-
-        sim_g102.compute_full_model(ids=c['id'][keep], mags=c['mag'][keep], verbose=False)
-
-        ## Grab object near the center of the image
-        dr = np.sqrt((sim_g102.catalog['x_flt'] - 579) ** 2 + (sim_g102.catalog['y_flt'] - 522) ** 2)
-        ix = np.argmin(dr)
-        id = sim_g102.catalog['id'][ix]
-
-        ## Spectrum cutouts
-        self.beam = griz_model.BeamCutout(sim_g102, beam=sim_g102.object_dispersers[id][2]['A'], conf=sim_g102.conf)
-
-        ## create basis model for sim
-        spec = S.ArraySpectrum(self.wv, self.fl, fluxunits='flam')
-        spec = spec.redshift(self.redshift).renorm(1., 'flam', S.ObsBandpass('wfc3,ir,f105w'))
-        spec.convert('flam')
-        
-        ## Compute the models
-        self.beam.compute_model(spectrum_1d=[spec.wave, spec.flux])
-
-        ## Extractions the model (error array here is meaningless)
-        w, f, e = self.beam.beam.optimal_extract(self.beam.model, bin=0)
+        self.gal_wv_rf = gal_wv[IDX] / (1 + self.redshift)
+        self.gal_wv = gal_wv[IDX]
+        self.gal_fl = gal_fl[IDX]
+        self.gal_er = gal_er[IDX]
 
         ## Get sensitivity function
-        sens_wv, sens_fl = [self.beam.beam.lam, self.beam.beam.sensitivity / np.max(self.beam.beam.sensitivity)]
-
-        ## adjust model flux  
-        IDX = [U for U in range(len(self.wv_obs)) if 8000 < self.wv_obs[U] < 11000]
+        flat = self.beam.flat_flam.reshape(self.beam.beam.sh_beam)
+        fwv, ffl, e = self.beam.beam.optimal_extract(flat, bin=0)
         
-        isens = interp1d(sens_wv, sens_fl)(self.wv_obs[IDX])
-
-        ifl = interp1d(w, f)(self.wv_obs[IDX])
-
-        C = Scale_model(self.fl[IDX], self.er[IDX], ifl / isens)
-               
-        ##trim and save outputs
-        IDX = [U for U in range(len(w)) if minwv <= w[U] <= maxwv]
-
-        self.mfl = C * f[IDX] / sens_fl[IDX]
-        self.mwv = w[IDX]
-        self.mer = np.mean(f[IDX]) / sens_fl[IDX]
-        self.mer /= np.trapz(self.mer,self.mwv)
-        self.mer *= np.trapz(self.mfl,self.mwv) / self.SNR
+        self.filt = interp1d(fwv, ffl)(self.gal_wv)
         
+    def Sim_spec(self, model_wv, model_fl, model_redshift = 0, dust = 0):
+        if model_redshift ==0:
+            model_redshift = self.redshift 
         
-    def Sim_data(self):
-        self.flx_err = np.abs(self.mfl + np.random.normal(0, self.mer))
+        ## Compute the models
+        self.beam.compute_model(spectrum_1d=[model_wv*(1+model_redshift),model_fl])
+
+        ## Extractions the model (error array here is meaningless)
+        w, f, e = self.beam.beam.optimal_extract(self.beam.model , bin=0)
+
+        ifl = interp1d(w, f)(self.gal_wv)
+        
+        C = Scale_model(self.gal_fl, self.gal_er, ifl / self.filt)
+
+        self.fl = C * ifl / self.filt
